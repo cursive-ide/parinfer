@@ -167,6 +167,7 @@ function parseOptions(options) {
 function initialParenTrail() {
   return {
     lineNo: UINT_NULL,       // [integer] - line number of the last parsed paren trail
+    lineStart: UINT_NULL,    // [integer] - start offset of the line of the paren trail
     startX: UINT_NULL,       // [integer] - x position of first paren in this range
     endX: UINT_NULL,         // [integer] - x position after the last paren in this range
     openers: [],             // [array of stack elements] - corresponding open-paren for each close-paren in this range
@@ -189,15 +190,12 @@ function getInitialResult(text, options, mode, smart) {
     origCursorX: UINT_NULL,    // [integer] - original cursorX option
     origCursorLine: UINT_NULL, // [integer] - original cursorLine option
 
-    inputLines:                // [string array] - input lines that we process line-by-line, char-by-char
-      text.split(LINE_ENDING_REGEX),
-    inputLineNo: -1,           // [integer] - the current input line number
-    inputX: -1,                // [integer] - the current input x position of the current character (ch)
-
-    lines: [],                 // [string array] - output lines (with corrected parens or indentation)
-    lineNo: -1,                // [integer] - output line number we are on
+    lineNo: -1,                // [integer] - line number we are processing
     ch: "",                    // [string] - character we are processing (can be changed to indicate a replacement)
-    x: 0,                      // [integer] - output x position of the current character (ch)
+    x: 0,                      // [integer] - x position of the current character (ch)
+    offset: 0,                 // [integer] - current char offset in input document
+    lineStart: 0,              // [integer] - the offset at which the current line starts
+    nextLineStart: 0,          // [integer] - the offset at which the next line will start
 
     parenStack: [],            // We track where we are in the Lisp tree by keeping a stack (array) of open-parens.
                                // Stack elements are objects containing keys {ch, x, lineNo, indentDelta}
@@ -216,6 +214,7 @@ function getInitialResult(text, options, mode, smart) {
 
     cursorX: UINT_NULL,        // [integer] - x position of the cursor
     cursorLine: UINT_NULL,     // [integer] - line number of the cursor
+    cursorLineStart: UINT_NULL, // [integer] - line start offset of the cursor line
     prevCursorX: UINT_NULL,    // [integer] - x position of the previous cursor
     prevCursorLine: UINT_NULL, // [integer] - line number of the previous cursor
 
@@ -240,6 +239,8 @@ function getInitialResult(text, options, mode, smart) {
     maxIndent: UINT_NULL,      // [integer] - maximum allowed indentation of subsequent lines in Paren Mode
     indentDelta: 0,            // [integer] - how far indentation was shifted by Paren Mode
                                //  (preserves relative indentation of nested expressions)
+    lineStartIndentDelta: 0,   // [integer] - the indent delta that was applied at the start of the line
+    lineIndentDelta: 0,        // [integer] - how much indent has been shifted at start of line by deletion of leading chars
 
     trackingArgTabStop: null,  // [string] - enum to track how close we are to the first-arg tabStop in a list
                                //  For example a tabStop occurs at `bar` below:
@@ -265,7 +266,8 @@ function getInitialResult(text, options, mode, smart) {
         x: null
       }
     },
-    errorPosCache: {}          // [object] - maps error name to a potential error position
+    errorPosCache: {},         // [object] - maps error name to a potential error position
+    edits: []                  // [object] - list of {startOffset, endOffset, replacement} to apply to original text
   };
 
   // Make sure no new properties are added to the result, for type safety.
@@ -318,9 +320,7 @@ errorMessages[ERROR_UNHANDLED] = "Unhandled error.";
 function cacheErrorPos(result, errorName) {
   var e = {
     lineNo: result.lineNo,
-    x: result.x,
-    inputLineNo: result.inputLineNo,
-    inputX: result.inputX
+    x: result.x
   };
   result.errorPosCache[errorName] = e;
   return e;
@@ -329,15 +329,12 @@ function cacheErrorPos(result, errorName) {
 function error(result, name) {
   var cache = result.errorPosCache[name];
 
-  var keyLineNo = result.partialResult ? 'lineNo' : 'inputLineNo';
-  var keyX = result.partialResult ? 'x' : 'inputX';
-
   var e = {
     parinferError: true,
     name: name,
     message: errorMessages[name],
-    lineNo: cache ? cache[keyLineNo] : result[keyLineNo],
-    x: cache ? cache[keyX] : result[keyX]
+    lineNo: cache ? cache.lineNo : result.lineNo,
+    x: cache ? cache.x : result.x
   };
   var opener = peek(result.parenStack, 0);
 
@@ -347,14 +344,14 @@ function error(result, name) {
     if (cache || opener) {
       e.extra = {
         name: ERROR_UNMATCHED_OPEN_PAREN,
-        lineNo: cache ? cache[keyLineNo] : opener[keyLineNo],
-        x: cache ? cache[keyX] : opener[keyX]
+        lineNo: cache ? cache.lineNo : opener.lineNo,
+        x: cache ? cache.x : opener.x
       };
     }
   }
   else if (name === ERROR_UNCLOSED_PAREN) {
-    e.lineNo = opener[keyLineNo];
-    e.x = opener[keyX];
+    e.lineNo = opener.lineNo;
+    e.x = opener.x;
   }
   return e;
 }
@@ -394,57 +391,64 @@ if (RUN_ASSERTS) {
   console.assert(repeatString('', 5) === '');
 }
 
-function getLineEnding(text) {
-  // NOTE: We assume that if the CR char "\r" is used anywhere,
-  //       then we should use CRLF line-endings after every line.
-  var i = text.search("\r");
-  if (i !== -1) {
-    return "\r\n";
-  }
-  return "\n";
-}
-
 //------------------------------------------------------------------------------
 // Line operations
 //------------------------------------------------------------------------------
 
-function isCursorAffected(result, start, end) {
-  if (result.cursorX === start &&
-      result.cursorX === end) {
-    return result.cursorX === 0;
+function isInsertion(edit) {
+  return edit.startOffset === edit.endOffset && edit.replace.length > 0
+}
+
+function replaceWithinLine(result, lineStart, start, end, replace) {
+  if (start === end && replace.length === 0) return;
+
+  var startOffset = lineStart + start;
+  var endOffset = lineStart + end;
+
+  if (start !== end && replace.length > 0 && result.origText.substring(startOffset, endOffset) === replace) return;
+
+  var edit = {startOffset: startOffset, endOffset: endOffset, replace: replace};
+
+  // Maintain the edits array in sorted order.
+  if (result.edits.length === 0) {
+    result.edits.push(edit);
+  } else {
+    var last = result.edits[result.edits.length - 1];
+    if (last.endOffset <= startOffset) {
+      result.edits.push(edit)
+    } else {
+      var i;
+      for (i = 0; i < result.edits.length; i++) {
+        if (startOffset < result.edits[i].startOffset ||
+            (startOffset === result.edits[i].startOffset && !isInsertion(result.edits[i]))) {
+          var startIndex = i;
+          var endIndex = i;
+          while (endIndex < result.edits.length &&
+                 result.edits[endIndex].startOffset >= startOffset &&
+                 (result.edits[endIndex].endOffset < endOffset ||
+                  (result.edits[endIndex].endOffset === endOffset && !isInsertion(result.edits[endIndex])))) {
+            endIndex++;
+          }
+          result.edits.splice(startIndex, endIndex - startIndex, edit);
+          break
+        }
+      }
+    }
   }
-  return result.cursorX >= end;
 }
 
-function shiftCursorOnEdit(result, lineNo, start, end, replace) {
-  var oldLength = end - start;
-  var newLength = replace.length;
-  var dx = newLength - oldLength;
-
-  if (dx !== 0 &&
-      result.cursorLine === lineNo &&
-      result.cursorX !== UINT_NULL &&
-      isCursorAffected(result, start, end)) {
-    result.cursorX += dx;
-  }
+function insertWithinLine(result, lineStart, idx, insert) {
+  replaceWithinLine(result, lineStart, idx, idx, insert);
 }
 
-function replaceWithinLine(result, lineNo, start, end, replace) {
-  var line = result.lines[lineNo];
-  var newLine = replaceWithinString(line, start, end, replace);
-  result.lines[lineNo] = newLine;
-
-  shiftCursorOnEdit(result, lineNo, start, end, replace);
-}
-
-function insertWithinLine(result, lineNo, idx, insert) {
-  replaceWithinLine(result, lineNo, idx, idx, insert);
-}
-
-function initLine(result, line) {
+function initLine(result) {
   result.x = 0;
   result.lineNo++;
-  result.lines.push(line);
+  result.lineStart = result.offset;
+
+  if (result.lineNo === result.cursorLine) {
+    result.cursorLineStart = result.lineStart;
+  }
 
   // reset line-specific state
   result.commentX = UINT_NULL;
@@ -455,16 +459,17 @@ function initLine(result, line) {
 
   result.trackingArgTabStop = null;
   result.trackingIndent = !result.isInStr;
+  result.lineIndentDelta = 0;
+  result.lineStartIndentDelta = 0;
 }
 
 // if the current character has changed, commit its change to the current line.
 function commitChar(result, origCh) {
   var ch = result.ch;
   if (origCh !== ch) {
-    replaceWithinLine(result, result.lineNo, result.x, result.x + origCh.length, ch);
+    replaceWithinLine(result, result.lineStart, result.x, result.x + origCh.length, ch);
     result.indentDelta -= (origCh.length - ch.length);
   }
-  result.x += ch.length;
 }
 
 //------------------------------------------------------------------------------
@@ -501,12 +506,12 @@ function peek(arr, idxFromBack) {
 
 if (RUN_ASSERTS) {
   console.assert(peek(['a'], 0) === 'a');
-  console.assert(peek(['a'], 1) === null);
+  console.assert(peek(['a'], 1) == null);
   console.assert(peek(['a', 'b', 'c'], 0) === 'c');
   console.assert(peek(['a', 'b', 'c'], 1) === 'b');
-  console.assert(peek(['a', 'b', 'c'], 5) === null);
-  console.assert(peek([], 0) === null);
-  console.assert(peek([], 1) === null);
+  console.assert(peek(['a', 'b', 'c'], 5) == null);
+  console.assert(peek([], 0) == null);
+  console.assert(peek([], 1) == null);
 }
 
 //------------------------------------------------------------------------------
@@ -530,7 +535,7 @@ function isValidCloseParen(parenStack, ch) {
 
 function isWhitespace(result) {
   var ch = result.ch;
-  return !result.isEscaped && (ch === BLANK_SPACE || ch === DOUBLE_SPACE);
+  return !result.isEscaped && (ch === BLANK_SPACE || ch === DOUBLE_SPACE || ch === NEWLINE);
 }
 
 // can this be the last code character of a list?
@@ -548,7 +553,7 @@ function checkCursorHolding(result) {
   var opener = peek(result.parenStack, 0);
   var parent = peek(result.parenStack, 1);
   var holdMinX = parent ? parent.x+1 : 0;
-  var holdMaxX = opener.x;
+  var holdMaxX = opener.x + opener.lineStartIndentDelta;
 
   var holding = (
     result.cursorLine === opener.lineNo &&
@@ -589,13 +594,11 @@ function trackArgTabStop(result, state) {
 function onOpenParen(result) {
   if (result.isInCode) {
     var opener = {
-      inputLineNo: result.inputLineNo,
-      inputX: result.inputX,
-
       lineNo: result.lineNo,
       x: result.x,
       ch: result.ch,
       indentDelta: result.indentDelta,
+      lineStartIndentDelta: result.lineStartIndentDelta,
       maxChildIndent: UINT_NULL
     };
 
@@ -635,7 +638,7 @@ function onMatchedCloseParen(result) {
     var origStartX = result.parenTrail.startX;
     var origEndX = result.parenTrail.endX;
     var origOpeners = result.parenTrail.openers;
-    resetParenTrail(result, result.lineNo, result.x+1);
+    resetParenTrail(result, result.x + 1);
     result.parenTrail.clamped.startX = origStartX;
     result.parenTrail.clamped.endX = origEndX;
     result.parenTrail.clamped.openers = origOpeners;
@@ -652,9 +655,7 @@ function onUnmatchedCloseParen(result) {
     cacheErrorPos(result, ERROR_UNMATCHED_CLOSE_PAREN);
     var opener = peek(result.parenStack, 0);
     if (opener) {
-      var e = cacheErrorPos(result, ERROR_UNMATCHED_OPEN_PAREN);
-      e.inputLineNo = opener.inputLineNo;
-      e.inputX = opener.inputX;
+      cacheErrorPos(result, ERROR_UNMATCHED_OPEN_PAREN);
     }
   }
   result.ch = "";
@@ -686,8 +687,17 @@ function onSemicolon(result) {
 }
 
 function onNewline(result) {
+  if (!result.forceBalance) {
+    checkUnmatchedOutsideParenTrail(result);
+    checkLeadingCloseParen(result);
+  }
+
+  if (result.lineNo === result.parenTrail.lineNo) {
+    finishNewParenTrail(result);
+  }
+
   result.isInComment = false;
-  result.ch = "";
+  result.nextLineStart = result.offset + 1
 }
 
 function onQuote(result) {
@@ -708,6 +718,7 @@ function onQuote(result) {
 
 function onBackslash(result) {
   result.isEscaping = true;
+  cacheErrorPos(result, ERROR_EOL_BACKSLASH);
 }
 
 function afterBackslash(result) {
@@ -744,7 +755,7 @@ function onChar(result) {
   result.isInCode = !result.isInComment && !result.isInStr;
 
   if (isClosable(result)) {
-    resetParenTrail(result, result.lineNo, result.x+ch.length);
+    resetParenTrail(result, result.x + ch.length);
   }
 
   var state = result.trackingArgTabStop;
@@ -781,9 +792,9 @@ function isCursorInComment(result, cursorX, cursorLine) {
 
 function handleChangeDelta(result) {
   if (result.changes && (result.smart || result.mode === PAREN_MODE)) {
-    var line = result.changes[result.inputLineNo];
+    var line = result.changes[result.lineNo];
     if (line) {
-      var change = line[result.inputX];
+      var change = line[result.x];
       if (change) {
         result.indentDelta += (change.newEndX - change.oldEndX);
       }
@@ -795,8 +806,9 @@ function handleChangeDelta(result) {
 // Paren Trail functions
 //------------------------------------------------------------------------------
 
-function resetParenTrail(result, lineNo, x) {
-  result.parenTrail.lineNo = lineNo;
+function resetParenTrail(result, x) {
+  result.parenTrail.lineNo = result.lineNo;
+  result.parenTrail.lineStart = result.lineStart;
   result.parenTrail.startX = x;
   result.parenTrail.endX = x;
   result.parenTrail.openers = [];
@@ -823,11 +835,11 @@ function clampParenTrailToCursor(result) {
     var newStartX = Math.max(startX, result.cursorX);
     var newEndX = Math.max(endX, result.cursorX);
 
-    var line = result.lines[result.lineNo];
+    var text = result.origText;
     var removeCount = 0;
     var i;
-    for (i = startX; i < newStartX; i++) {
-      if (isCloseParen(line[i])) {
+    for (i = result.lineStart + startX; i < result.lineStart + newStartX; i++) {
+      if (isCloseParen(text[i])) {
         removeCount++;
       }
     }
@@ -863,8 +875,8 @@ function getParentOpenerIndex(result, indentX) {
   var i;
   for (i=0; i<result.parenStack.length; i++) {
     var opener = peek(result.parenStack, i);
-    var currOutside = (opener.x < indentX);
-    var prevOutside = (opener.x - opener.indentDelta < indentX);
+    var currOutside = (opener.x + opener.lineStartIndentDelta < indentX);
+    var prevOutside = (opener.x + opener.lineStartIndentDelta - opener.indentDelta < indentX);
 
     if (prevOutside) {
       // If an open-paren WAS outside, its `indentDelta` will be used to KEEP IT
@@ -903,7 +915,7 @@ function correctParenTrail(result, indentX) {
   }
 
   if (result.parenTrail.lineNo !== UINT_NULL) {
-    replaceWithinLine(result, result.parenTrail.lineNo, result.parenTrail.startX, result.parenTrail.endX, parens);
+    replaceWithinLine(result, result.parenTrail.lineStart, result.parenTrail.startX, result.parenTrail.endX, parens);
     result.parenTrail.endX = result.parenTrail.startX + parens.length;
     rememberParenTrail(result);
   }
@@ -919,13 +931,13 @@ function cleanParenTrail(result) {
     return;
   }
 
-  var line = result.lines[result.lineNo];
+  var text = result.origText;
   var newTrail = "";
   var spaceCount = 0;
   var i;
-  for (i = startX; i < endX; i++) {
-    if (isCloseParen(line[i])) {
-      newTrail += line[i];
+  for (i = result.lineStart + startX; i < result.lineStart + endX; i++) {
+    if (isCloseParen(text[i])) {
+      newTrail += text[i];
     }
     else {
       spaceCount++;
@@ -933,7 +945,7 @@ function cleanParenTrail(result) {
   }
 
   if (spaceCount > 0) {
-    replaceWithinLine(result, result.lineNo, startX, endX, newTrail);
+    replaceWithinLine(result, result.lineStart, startX, endX, newTrail);
     result.parenTrail.endX -= spaceCount;
   }
 }
@@ -947,9 +959,8 @@ function appendParenTrail(result) {
   }
 
   setMaxIndent(result, opener);
-  insertWithinLine(result, result.parenTrail.lineNo, result.parenTrail.endX, closeCh);
+  insertWithinLine(result, result.parenTrail.lineStart, result.parenTrail.endX, closeCh);
 
-  result.parenTrail.endX++;
   result.parenTrail.openers.push(opener);
   updateRememberedParenTrail(result);
 }
@@ -972,7 +983,7 @@ function setMaxIndent(result, opener) {
       parent.maxChildIndent = opener.x;
     }
     else {
-      result.maxIndent = opener.x;
+      result.maxIndent = opener.x + opener.lineStartIndentDelta;
     }
   }
 }
@@ -1031,12 +1042,12 @@ function finishNewParenTrail(result) {
 //------------------------------------------------------------------------------
 
 function addIndent(result, delta) {
-  var origIndent = result.x;
+  var origIndent = result.x + result.lineIndentDelta;
   var newIndent = origIndent + delta;
   var indentStr = repeatString(BLANK_SPACE, newIndent);
-  replaceWithinLine(result, result.lineNo, 0, origIndent, indentStr);
-  result.x = newIndent;
+  replaceWithinLine(result, result.lineStart, 0, result.x, indentStr);
   result.indentDelta += delta;
+  result.lineStartIndentDelta = result.indentDelta;
 }
 
 function shouldAddOpenerIndent(result, opener) {
@@ -1046,15 +1057,15 @@ function shouldAddOpenerIndent(result, opener) {
 }
 
 function correctIndent(result) {
-  var origIndent = result.x;
+  var origIndent = result.x + result.lineIndentDelta;
   var newIndent = origIndent;
   var minIndent = 0;
   var maxIndent = result.maxIndent;
 
   var opener = peek(result.parenStack, 0);
   if (opener) {
-    minIndent = opener.x + 1;
-    maxIndent = opener.maxChildIndent;
+    minIndent = opener.x + opener.lineStartIndentDelta + 1;
+    maxIndent = opener.maxChildIndent === UINT_NULL ? UINT_NULL: opener.maxChildIndent + opener.lineStartIndentDelta;
     if (shouldAddOpenerIndent(result, opener)) {
       newIndent += opener.indentDelta;
     }
@@ -1105,6 +1116,7 @@ function onLeadingCloseParen(result) {
       }
     }
     result.skipChar = true;
+    result.lineIndentDelta--;
   }
   if (result.mode === PAREN_MODE) {
     if (!isValidCloseParen(result.parenStack, result.ch)) {
@@ -1116,6 +1128,7 @@ function onLeadingCloseParen(result) {
     else {
       appendParenTrail(result);
       result.skipChar = true;
+      result.lineIndentDelta--;
     }
   }
 }
@@ -1162,10 +1175,10 @@ function checkIndent(result) {
   }
 }
 
-function makeTabStop(result, opener) {
+function makeTabStop(opener) {
   var tabStop = {
     ch: opener.ch,
-    x: opener.x,
+    x: opener.x + opener.lineStartIndentDelta,
     lineNo: opener.lineNo
   };
   if (opener.argX != null) {
@@ -1185,12 +1198,12 @@ function setTabStops(result) {
 
   var i;
   for (i=0; i<result.parenStack.length; i++) {
-    result.tabStops.push(makeTabStop(result, result.parenStack[i]));
+    result.tabStops.push(makeTabStop(result.parenStack[i]));
   }
 
   if (result.mode === PAREN_MODE) {
     for (i=result.parenTrail.openers.length-1; i>=0; i--) {
-      result.tabStops.push(makeTabStop(result, result.parenTrail.openers[i]));
+      result.tabStops.push(makeTabStop(result.parenTrail.openers[i]));
     }
   }
 
@@ -1209,6 +1222,12 @@ function setTabStops(result) {
 //------------------------------------------------------------------------------
 
 function processChar(result, ch) {
+  if (result.offset === result.nextLineStart) {
+    initLine(result);
+
+    setTabStops(result);
+  }
+
   var origCh = ch;
 
   result.ch = ch;
@@ -1230,18 +1249,7 @@ function processChar(result, ch) {
   commitChar(result, origCh);
 }
 
-function processLine(result, lineNo) {
-  initLine(result, result.inputLines[lineNo]);
-
-  setTabStops(result);
-
-  var x;
-  for (x = 0; x < result.inputLines[lineNo].length; x++) {
-    result.inputX = x;
-    processChar(result, result.inputLines[lineNo][x]);
-  }
-  processChar(result, NEWLINE);
-
+function finalizeResult(result) {
   if (!result.forceBalance) {
     checkUnmatchedOutsideParenTrail(result);
     checkLeadingCloseParen(result);
@@ -1250,9 +1258,13 @@ function processLine(result, lineNo) {
   if (result.lineNo === result.parenTrail.lineNo) {
     finishNewParenTrail(result);
   }
-}
 
-function finalizeResult(result) {
+  if (result.origText.length === result.nextLineStart) {
+    initLine(result);
+
+    setTabStops(result);
+  }
+
   if (result.quoteDanger) { throw error(result, ERROR_QUOTE_DANGER); }
   if (result.isInStr)     { throw error(result, ERROR_UNCLOSED_QUOTE); }
 
@@ -1286,9 +1298,10 @@ function processText(text, options, mode, smart) {
 
   try {
     var i;
-    for (i = 0; i < result.inputLines.length; i++) {
-      result.inputLineNo = i;
-      processLine(result, i);
+    for (i = 0; i < result.origText.length; i++) {
+      result.offset = i;
+      processChar(result, result.origText[i]);
+      result.x++;
     }
     finalizeResult(result);
   }
@@ -1306,14 +1319,70 @@ function processText(text, options, mode, smart) {
 // Public API
 //------------------------------------------------------------------------------
 
+function resultText(result) {
+  var text = result.origText;
+
+  var delta = 0;
+  for (var i = 0; i < result.edits.length; i++) {
+    var edit = result.edits[i];
+    if (edit.startOffset === edit.endOffset) {
+      // Insert case - Cursive uses document.insertString()
+      var at = edit.startOffset + delta;
+      text = text.substring(0, at) + edit.replace + text.substring(at);
+      delta += edit.replace.length;
+    } else if (edit.replace.length === 0) {
+      // Delete case - Cursive uses document.deleteString()
+      text = text.substring(0, edit.startOffset + delta) + text.substring(edit.endOffset + delta);
+      delta -= (edit.endOffset - edit.startOffset);
+    } else {
+      // Replace case - Cursive uses document.replaceString()
+      text = text.substring(0, edit.startOffset + delta) + edit.replace + text.substring(edit.endOffset + delta);
+      delta += edit.replace.length - (edit.endOffset - edit.startOffset);
+    }
+  }
+
+  return text;
+}
+
+function isCursorAffected(cursorOffset, cursorLineStart, start, end) {
+  if (cursorOffset === start &&
+      cursorOffset === end) {
+    return cursorOffset === cursorLineStart;
+  }
+  return start >= cursorLineStart && cursorOffset >= end;
+}
+
+function shiftCursorOnEdit(cursorOffset, cursorLineStart, start, end, replace) {
+  var oldLength = end - start;
+  var newLength = replace.length;
+  var dx = newLength - oldLength;
+
+  if (dx !== 0 && isCursorAffected(cursorOffset, cursorLineStart, start, end)) {
+    return dx;
+  }
+  return 0;
+}
+
+function resultCursorX(result) {
+  var cursorOffset = result.cursorLineStart + result.cursorX;
+  var cursorDx = 0;
+  for (var i = 0; i < result.edits.length; i++) {
+    var edit = result.edits[i];
+    cursorDx += shiftCursorOnEdit(cursorOffset,
+                                  result.cursorLineStart,
+                                  edit.startOffset,
+                                  edit.endOffset,
+                                  edit.replace);
+  }
+  return cursorOffset + cursorDx - result.cursorLineStart;
+}
+
 function publicResult(result) {
-  var lineEnding = getLineEnding(result.origText);
   var final;
+
   if (result.success) {
     final = {
-      text: result.lines.join(lineEnding),
-      cursorX: result.cursorX,
-      cursorLine: result.cursorLine,
+      edits: result.edits,
       success: true,
       tabStops: result.tabStops,
       parenTrails: result.parenTrails
@@ -1324,9 +1393,7 @@ function publicResult(result) {
   }
   else {
     final = {
-      text: result.partialResult ? result.lines.join(lineEnding) : result.origText,
-      cursorX: result.partialResult ? result.cursorX : result.origCursorX,
-      cursorLine: result.partialResult ? result.cursorLine : result.origCursorLine,
+      edits: result.partialResult ? result.edits : [],
       parenTrails: result.partialResult ? result.parenTrails : null,
       success: false,
       error: result.error
@@ -1335,8 +1402,6 @@ function publicResult(result) {
       final.parens = result.parens;
     }
   }
-  if (final.cursorX === UINT_NULL) { delete final.cursorX; }
-  if (final.cursorLine === UINT_NULL) { delete final.cursorLine; }
   if (final.tabStops && final.tabStops.length === 0) { delete final.tabStops; }
   return final;
 }

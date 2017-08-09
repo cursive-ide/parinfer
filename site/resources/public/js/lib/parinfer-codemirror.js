@@ -441,7 +441,6 @@ function fixText(state, changes) {
   var cm = state.cm;
   var text = cm.getValue();
   var hasSelection = cm.somethingSelected();
-  var selections = cm.listSelections();
   var cursor = cm.getCursor();
   var scroller = cm.getScrollerElement();
 
@@ -496,15 +495,32 @@ function fixText(state, changes) {
     // Backup history
     var hist = cm.getHistory();
 
-    // Update text
-    cm.setValue(result.text);
-
-    // Update cursor and selection
+    // Don't record cursor movements as a result of edits
     state.monitorCursor = false;
-    if (hasSelection) {
-      cm.setSelections(selections);
-    } else {
-      cm.setCursor(result.cursorLine, result.cursorX);
+
+    // Update text
+    var delta = 0;
+    for (var i = 0; i < result.edits.length; i++) {
+      var edit = result.edits[i];
+      if (edit.startOffset === edit.endOffset) {
+        // Insert case - Cursive uses document.insertString()
+        var at = cm.posFromIndex(edit.startOffset + delta);
+        cm.replaceRange(edit.replace, at);
+        delta += edit.replace.length;
+        // Commented out - CodeMirror doesn't distinguish deletes from replacements
+      // } else if (edit.replace.length === 0) {
+      //   // Delete case - Cursive uses document.deleteString()
+      //   var from = cm.posFromIndex(edit.startOffset + delta);
+      //   var to = cm.posFromIndex(edit.endOffset + delta);
+      //   cm.replaceRange("", from, to);
+      //   delta -= (edit.endOffset - edit.startOffset);
+      } else {
+        // Replace case - Cursive uses document.replaceString()
+        var from = cm.posFromIndex(edit.startOffset + delta);
+        var to = cm.posFromIndex(edit.endOffset + delta);
+        cm.replaceRange(edit.replace, from, to);
+        delta += edit.replace.length - (edit.endOffset - edit.startOffset);
+      }
     }
 
     // Restore history to avoid pushing our edits to the history stack.
@@ -521,8 +537,8 @@ function fixText(state, changes) {
   updateParenTrailMarks(cm, result.parenTrails);
 
   // Remember the cursor position for next time
-  state.prevCursorLine = result.cursorLine;
-  state.prevCursorX = result.cursorX;
+  state.prevCursorLine = cursor.line;
+  state.prevCursorX = cursor.ch;
 
   if (locus) {
     updateLocusLayer(cm, result.parens);
