@@ -491,7 +491,7 @@ function fixText(state, changes) {
   // Remember tab stops for smart tabbing.
   state.tabStops = result.tabStops;
 
-  if (text !== result.text) {
+  if (result.edits.length !== 0) {
     // Backup history
     var hist = cm.getHistory();
 
