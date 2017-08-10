@@ -505,7 +505,7 @@ function fixText(state, changes) {
       if (edit.startOffset === edit.endOffset) {
         // Insert case - Cursive uses document.insertString()
         var at = cm.posFromIndex(edit.startOffset + delta);
-        cm.replaceRange(edit.replace, at);
+        cm.replaceRange(edit.replace, at, at, "parinfer");
         delta += edit.replace.length;
         // Commented out - CodeMirror doesn't distinguish deletes from replacements
       // } else if (edit.replace.length === 0) {
@@ -518,7 +518,7 @@ function fixText(state, changes) {
         // Replace case - Cursive uses document.replaceString()
         var from = cm.posFromIndex(edit.startOffset + delta);
         var to = cm.posFromIndex(edit.endOffset + delta);
-        cm.replaceRange(edit.replace, from, to);
+        cm.replaceRange(edit.replace, from, to, "parinfer");
         delta += edit.replace.length - (edit.endOffset - edit.startOffset);
       }
     }
@@ -569,7 +569,7 @@ function onCursorChange(state) {
 function onTextChanges(state, changes) {
   clearTimeout(state.cursorTimeout);
   var origin = changes[0].origin;
-  if (origin !== 'setValue') {
+  if (origin !== 'parinfer') {
     fixText(state, changes);
   }
 }
